@@ -1,4 +1,6 @@
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+import io
 import json
 from pathlib import Path
 import shlex
@@ -8,7 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from quota_guard import Guard, check_snapshot, explicit_override, stamp, write_json
+from quota_guard import (Guard, brief, check_snapshot, doctor, explicit_override,
+                         install, load_hook_inventory, main, stamp, write_json)
 
 
 class QuotaGuardTests(unittest.TestCase):
@@ -37,7 +40,7 @@ class QuotaGuardTests(unittest.TestCase):
         return self.guard.handle(self.event)
 
     def test_above_cutoff_allows_without_cli(self):
-        with patch("subprocess.run", side_effect=AssertionError("must not launch CLI")):
+        with patch("quota_guard.subprocess.Popen", side_effect=AssertionError("must not launch CLI")):
             self.assertIsNone(self.call(session=3.1))
 
     def test_session_at_three_is_denied(self):
@@ -78,7 +81,7 @@ class QuotaGuardTests(unittest.TestCase):
 
     def test_explicit_override_does_not_read_cache_or_leak(self):
         self.guard.handle(dict(self.event, hook_event_name="UserPromptSubmit",
-                               prompt="Ignore quota cutoff for this task.\nRun my command."))
+                               prompt="Ignore quota cutoff for this task\nRun my command."))
         with patch.object(self.guard, "fetch", side_effect=AssertionError("must not read quota")):
             self.assertIsNone(self.guard.handle(self.event))
         for changes in ({"turn_id": "turn-two"}, {"session_id": "session-two"}):
@@ -88,9 +91,11 @@ class QuotaGuardTests(unittest.TestCase):
     def test_continue_and_quoted_examples_do_not_override(self):
         for prompt in ("continue", 'Say "Ignore quota cutoff for this task"',
                        "```\nIgnore quota cutoff for this task\n```", "> Ignore quota cutoff for this task",
-                       "```\n~~~\nIgnore quota cutoff for this task\n```"):
+                       "```\n~~~\nIgnore quota cutoff for this task\n```",
+                       "Ignore the 3% quota cutoff for this turn!", "Ignore quota cutoff for this task.",
+                       "ignore quota cutoff for this task"):
             self.assertFalse(explicit_override(prompt))
-        self.assertTrue(explicit_override("Ignore the 3% quota cutoff for this turn!"))
+        self.assertTrue(explicit_override("Run a check.\nIgnore quota cutoff for this task\nThen continue."))
 
     def test_each_call_reads_the_latest_widget_file(self):
         self.assertIsNone(self.call())
@@ -105,7 +110,7 @@ class QuotaGuardTests(unittest.TestCase):
 
     def test_corrupt_cache_does_not_launch_cli(self):
         self.snapshot.write_text("broken json")
-        with patch("subprocess.run", side_effect=AssertionError("must not launch CLI")):
+        with patch("quota_guard.subprocess.Popen", side_effect=AssertionError("must not launch CLI")):
             output = self.guard.handle(self.event)
         self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
 
@@ -202,12 +207,286 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit", "Stop"})
         for groups in hooks.values():
             command = shlex.split(groups[0]["hooks"][0]["command"])
-            self.assertIn("/tmp/state with spaces", command)
+            self.assertIn(str(Path("/tmp/state with spaces").resolve()), command)
             self.assertIn("5.0", command)
 
     def test_cli_rejects_invalid_limits(self):
         for args in (("--stop-at", "nan"), ("--stop-at", "101"), ("--max-age", "0")):
             self.assertEqual(self.cli("--check", *args).returncode, 2)
+
+    def test_brief_literal_output_and_age(self):
+        data = self.snapshot_data(session=88, weekly=94, age=310)
+        write_json(self.snapshot, data)
+        now = datetime.fromisoformat(data["generatedAt"].replace("Z", "+00:00"))
+        self.assertEqual(brief(check_snapshot(self.snapshot, now=now)),
+                         "Session 88% | Weekly 94% | Updated 5m ago")
+
+    def test_cli_brief_exit_codes_and_cutoff_message(self):
+        write_json(self.snapshot, self.snapshot_data(session=3))
+        result = self.cli("--brief")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("Session 3% | Weekly 50%", result.stdout)
+        self.assertIn("STOP (3% cutoff)", result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        write_json(self.snapshot, self.snapshot_data(session=4))
+        self.assertEqual(self.cli("--brief").returncode, 0)
+        self.assertEqual(self.cli("--brief", "--stop-at", "5").returncode, 3)
+        self.snapshot.unlink()
+        result = self.cli("--brief")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout.strip(),
+                         "Session ? | Weekly ? | UNAVAILABLE (widget_snapshot_missing_or_invalid)")
+
+    def test_brief_unknown_remains_unavailable_with_partial_quota(self):
+        data = self.snapshot_data()
+        data["entries"][0]["usageRows"].pop()
+        write_json(self.snapshot, data)
+        report = check_snapshot(self.snapshot)
+        self.assertEqual(report["decision"], "unknown")
+        self.assertIn("Session 50% | Weekly ?", brief(report))
+        self.assertIn("UNAVAILABLE (incomplete_window_coverage)", brief(report))
+
+    def doctor_fixture(self):
+        home = Path(self.directory.name) / "codex"
+        target = home / "hooks/quota_guard.py"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(Path(__file__).with_name("quota_guard.py").read_bytes())
+        inventory = {"data": [{"errors": [], "hooks": [
+            {"eventName": event, "command": shlex.join([sys.executable, str(target)]),
+             "enabled": True, "trustStatus": "trusted", "matcher": None, "async": False}
+            for event in ("preToolUse", "userPromptSubmit", "stop")]}]}
+        write_json(self.snapshot, self.snapshot_data())
+        return home, inventory
+
+    def test_doctor_checks_native_enablement_and_trust(self):
+        home, inventory = self.doctor_fixture()
+        with patch("quota_guard.load_hook_inventory", return_value=inventory):
+            checks = doctor(home, self.snapshot)
+        self.assertEqual([name for ok, name, _ in checks if ok],
+                         ["Widget snapshot", "Installed script", "Hook configuration",
+                          "preToolUse", "userPromptSubmit", "stop"])
+        self.assertTrue(all(ok for ok, _, _ in checks))
+
+    def test_doctor_reports_disabled_modified_or_missing_hooks(self):
+        home, inventory = self.doctor_fixture()
+        hooks = inventory["data"][0]["hooks"]
+        hooks[0]["enabled"] = False
+        hooks[1]["trustStatus"] = "modified"
+        hooks.pop()
+        with patch("quota_guard.load_hook_inventory", return_value=inventory):
+            checks = doctor(home, self.snapshot)
+        self.assertEqual([(ok, name) for ok, name, _ in checks[-3:]],
+                         [(False, "preToolUse"), (False, "userPromptSubmit"), (False, "stop")])
+        self.assertIn("review and enable", checks[-2][2])
+        self.assertIn("Not registered", checks[-1][2])
+
+    def test_doctor_rejects_restricted_async_and_checker_hooks(self):
+        home, inventory = self.doctor_fixture()
+        hooks = inventory["data"][0]["hooks"]
+        hooks[0]["matcher"] = "Bash"
+        hooks[1]["async"] = True
+        hooks[2]["command"] += " --check"
+        with patch("quota_guard.load_hook_inventory", return_value=inventory):
+            checks = doctor(home, self.snapshot)
+        self.assertTrue(all(not ok for ok, _, _ in checks[-3:]))
+        self.assertIn("Restricted matcher", checks[-3][2])
+        self.assertIn("not in hook mode", checks[-1][2])
+
+    def test_doctor_detects_old_script_stale_cache_and_config_errors(self):
+        home, inventory = self.doctor_fixture()
+        (home / "hooks/quota_guard.py").write_text("# old script\n")
+        write_json(self.snapshot, self.snapshot_data(age=601))
+        inventory["data"][0]["errors"] = [{"message": "Bad hooks.json"}]
+        with patch("quota_guard.load_hook_inventory", return_value=inventory):
+            checks = doctor(home, self.snapshot)
+        self.assertEqual([(ok, name) for ok, name, _ in checks[:3]],
+                         [(False, "Widget snapshot"), (False, "Installed script"),
+                          (False, "Hook configuration")])
+
+    def test_doctor_missing_cli_has_actionable_failure_and_exit_code(self):
+        home, _ = self.doctor_fixture()
+        output = io.StringIO()
+        with patch("quota_guard.shutil.which", return_value=None), redirect_stdout(output):
+            result = main(["--doctor", "--snapshot", str(self.snapshot), "--codex-home", str(home)])
+        self.assertEqual(result, 2)
+        self.assertIn("FAIL Hook inventory", output.getvalue())
+        self.assertIn("check PATH and /hooks", output.getvalue())
+
+    def test_doctor_valid_setup_reports_cutoff_without_invalidating_installation(self):
+        home, inventory = self.doctor_fixture()
+        write_json(self.snapshot, self.snapshot_data(session=3))
+        output = io.StringIO()
+        with patch("quota_guard.load_hook_inventory", return_value=inventory), redirect_stdout(output):
+            result = main(["--doctor", "--snapshot", str(self.snapshot), "--codex-home", str(home)])
+        self.assertEqual(result, 0)
+        self.assertIn("STOP (3% cutoff)", output.getvalue())
+
+    def test_native_inventory_protocol_queries_hooks_without_starting_a_task(self):
+        executable = Path(self.directory.name) / "codex"
+        executable.write_text("#!/usr/bin/env python3\n" + """
+import json
+import os
+import sys
+assert sys.argv[1:] == ['app-server', '--stdio']
+methods = []
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    methods.append(method)
+    assert method in ('initialize', 'hooks/list')
+    result = {} if method == 'initialize' else {
+        'data': [{'cwd': os.environ['CODEX_HOME'], 'errors': [], 'hooks': []}],
+        'methods': methods}
+    print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+""")
+        executable.chmod(0o700)
+        home = Path(self.directory.name) / "codex home"
+        with patch("quota_guard.shutil.which", return_value=str(executable)):
+            result = load_hook_inventory(home, Path(self.directory.name))
+        self.assertEqual(result["methods"], ["initialize", "hooks/list"])
+        self.assertEqual(result["data"], [{"cwd": str(home), "errors": [], "hooks": []}])
+
+
+class InstallerTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name) / "codex home"
+        self.home.mkdir()
+        self.target = self.home / "hooks/quota_guard.py"
+        self.config = self.home / "hooks.json"
+        self.source = Path(__file__).with_name("quota_guard.py")
+        self.command = shlex.join([sys.executable, str(self.target), "--stop-at", "3", "--max-age", "600"])
+
+    def test_fresh_install_and_quoted_command(self):
+        result = install(self.home, self.command)
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["review"])
+        self.assertEqual(self.target.read_bytes(), self.source.read_bytes())
+        hooks = json.loads(self.config.read_text())["hooks"]
+        self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit", "Stop"})
+        for groups in hooks.values():
+            handler = groups[0]["hooks"][0]
+            self.assertEqual(shlex.split(handler["command"])[1], str(self.target))
+            self.assertIs(handler["async"], False)
+        self.assertEqual(self.target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_preserves_unrelated_hooks_and_other_config(self):
+        unrelated = {"type": "command", "command": "notify-me", "timeout": 10}
+        config = {"description": "My hooks", "hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [unrelated]}],
+            "Stop": [{"hooks": [unrelated]}], "SessionStart": [{"hooks": [unrelated]}]}}
+        self.config.write_text(json.dumps(config, indent=2))
+        install(self.home, self.command)
+        updated = json.loads(self.config.read_text())
+        self.assertEqual(updated["description"], "My hooks")
+        self.assertEqual(updated["hooks"]["SessionStart"], config["hooks"]["SessionStart"])
+        for event in ("PreToolUse", "Stop"):
+            self.assertEqual(updated["hooks"][event][0], config["hooks"][event][0])
+            self.assertEqual(len(updated["hooks"][event]), 2)
+
+    def test_repeat_install_does_not_write_or_make_backups(self):
+        install(self.home, self.command)
+        before = (self.config.read_bytes(), self.config.stat().st_mtime_ns, self.target.stat().st_mtime_ns,
+                  list((self.home / "hooks/backups").iterdir()))
+        result = install(self.home, self.command)
+        after = (self.config.read_bytes(), self.config.stat().st_mtime_ns, self.target.stat().st_mtime_ns,
+                 list((self.home / "hooks/backups").iterdir()))
+        self.assertFalse(result["changed"])
+        self.assertIsNone(result["backup"])
+        self.assertEqual(before, after)
+
+    def test_upgrade_backs_up_exact_originals_privately(self):
+        old_config = b'{"hooks": {}}\n'
+        old_script = b"# old script\n"
+        self.config.write_bytes(old_config)
+        self.target.parent.mkdir()
+        self.target.write_bytes(old_script)
+        result = install(self.home, self.command)
+        self.assertEqual((result["backup"] / "hooks.json").read_bytes(), old_config)
+        self.assertEqual((result["backup"] / "quota_guard.py").read_bytes(), old_script)
+        self.assertEqual(result["backup"].stat().st_mode & 0o777, 0o700)
+        for path in result["backup"].iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_malformed_config_leaves_config_and_script_untouched(self):
+        self.target.parent.mkdir()
+        self.target.write_bytes(b"# original\n")
+        for content in ("not json", "[]", '{"hooks": []}',
+                        '{"hooks":{"PreToolUse":"bad"}}', '{"hooks":{"Stop":[{}]}}'):
+            self.config.write_text(content)
+            with self.assertRaises(ValueError):
+                install(self.home, self.command)
+            self.assertEqual(self.config.read_text(), content)
+            self.assertEqual(self.target.read_bytes(), b"# original\n")
+            self.assertFalse((self.home / "hooks/backups").exists())
+
+    def test_updates_scoped_and_duplicate_guards_preserving_other_positions(self):
+        guard = {"type": "command", "command": self.command, "async": True}
+        unrelated = {"type": "command", "command": "notify-me"}
+        other_guard = {"type": "command", "command": "python3 /different/quota_guard.py"}
+        config = {"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [guard, unrelated]},
+            {"hooks": [dict(guard, statusMessage="Quota"), other_guard]},
+            {"hooks": [guard]}]}}
+        self.config.write_text(json.dumps(config))
+        install(self.home, self.command)
+        groups = json.loads(self.config.read_text())["hooks"]["PreToolUse"]
+        self.assertEqual(groups[0]["matcher"], "Bash")
+        self.assertEqual(groups[0]["hooks"][1], unrelated)
+        self.assertIs(groups[0]["hooks"][0]["async"], False)
+        self.assertEqual(groups[1]["hooks"][0]["statusMessage"], "Quota")
+        self.assertIs(groups[1]["hooks"][0]["async"], False)
+        self.assertEqual(groups[1]["hooks"][1], other_guard)
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(len(groups[2]["hooks"]), 1)
+        self.assertIs(groups[2]["hooks"][0]["async"], False)
+
+    def test_only_scoped_guard_gets_an_all_tool_group_without_moving_handlers(self):
+        unrelated = {"type": "command", "command": "notify-me"}
+        config = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": self.command}, unrelated]}]}}
+        self.config.write_text(json.dumps(config))
+        install(self.home, self.command)
+        groups = json.loads(self.config.read_text())["hooks"]["PreToolUse"]
+        self.assertEqual(groups[0]["hooks"][1], unrelated)
+        self.assertEqual(len(groups), 2)
+        self.assertNotIn("matcher", groups[1])
+        self.assertEqual(groups[1]["hooks"][0]["command"], self.command)
+
+    def test_config_write_failure_restores_old_script(self):
+        old_config = b'{"hooks": {}}'
+        self.config.write_bytes(old_config)
+        self.target.parent.mkdir()
+        self.target.write_bytes(b"# original\n")
+        with patch("quota_guard.write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                install(self.home, self.command)
+        self.assertEqual(self.config.read_bytes(), old_config)
+        self.assertEqual(self.target.read_bytes(), b"# original\n")
+
+    def test_config_write_failure_removes_new_script(self):
+        self.config.write_text('{"hooks": {}}')
+        with patch("quota_guard.write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                install(self.home, self.command)
+        self.assertEqual(self.config.read_text(), '{"hooks": {}}')
+        self.assertFalse(self.target.exists())
+
+    def test_cli_install_resolves_relative_option_paths(self):
+        result = subprocess.run([sys.executable, str(self.source.resolve()), "--install",
+                                 "--codex-home", str(self.home), "--snapshot", "cache with spaces.json",
+                                 "--state-dir", "state with spaces", "--stop-at", "5"],
+                                cwd=self.home, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command = json.loads(self.config.read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        arguments = shlex.split(command)
+        self.assertIn(str((self.home / "cache with spaces.json").resolve()), arguments)
+        self.assertIn(str((self.home / "state with spaces").resolve()), arguments)
+        self.assertIn("5.0", arguments)
 
 
 if __name__ == "__main__":
