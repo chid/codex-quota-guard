@@ -56,6 +56,54 @@ summary and the reported quota/reset information. Do not retry, wait for
 an automatic reset, switch accounts, or bypass the guard with other tools.
 ```
 
+## Choose five-hour and weekly cutoffs
+
+Cutoffs are percentages **remaining**, from `0` to `100`. For example, `5` means stop at 5% remaining (95% used). The cutoff is inclusive: either window at or below its own cutoff stops work. The `Session` label refers to the five-hour quota window.
+
+| Option | Window | Default |
+| --- | --- | --- |
+| `--stop-at PERCENT` | Shared cutoff for both windows | `3` |
+| `--session-stop-at PERCENT` | Override for the five-hour/session window | Inherits `--stop-at` |
+| `--weekly-stop-at PERCENT` | Override for the weekly window | Inherits `--stop-at` |
+
+From the checkout root, install a guard that stops at **5% five-hour remaining or 10% weekly remaining**:
+
+```sh
+python3 quota_guard.py --install --session-stop-at 5 --weekly-stop-at 10
+```
+
+Other examples:
+
+```sh
+# Use 5% for both windows.
+python3 quota_guard.py --install --stop-at 5
+
+# Change weekly to 10%; five-hour keeps the default 3%.
+python3 quota_guard.py --install --weekly-stop-at 10
+
+# Use 4% five-hour and 10% weekly, regardless of option order.
+python3 quota_guard.py --install --stop-at 4 --weekly-stop-at 10
+```
+
+To change an existing installation, rerun `--install` with all your intended settings. Omitted options return to their defaults. Review and trust the updated definitions in `/hooks`, then start a new session to load them. For manual configuration, use `--print-hooks` with the same cutoff options.
+
+Standalone checks use the options supplied to that invocation. Repeat your cutoff settings to check the same policy or gate a command:
+
+```sh
+python3 quota_guard.py --brief --session-stop-at 5 --weekly-stop-at 10
+python3 quota_guard.py --check --session-stop-at 5 --weekly-stop-at 10 && your-command
+```
+
+The JSON report includes effective cutoffs in `cutoffs_percent` (`primary` = five-hour; `secondary` = weekly) and each window's `stop_at_percent`. The root `stop_at_percent` retains the shared fallback. Missing or stale readings still block work with custom cutoffs.
+
+## Does the guard consume tokens?
+
+The local guard makes no model requests. `--check`, `--brief`, and ordinary hook checks read the snapshot and private state locally, so executing them does not itself use model tokens or draw down Codex subscription quota. `--doctor` starts a local Codex app server to inspect hooks, but does not start a model task.
+
+A successful `PreToolUse` check returns no model-visible output. When work is denied or you explicitly override, the guard returns a short message. Codex can include hook feedback and `additionalContext` in the model's context, so these messages can add input tokens to subsequent model requests. See [OpenAI's hook-output documentation](https://learn.chatgpt.com/docs/hooks#large-hook-output).
+
+Asking Codex to run and explain a quota check uses tokens for the surrounding assistant work and any status output included in context. Running `--brief` directly in your terminal performs only the local check. The guard stops further tool use; it cannot refund earlier usage or cancel a model request already in progress.
+
 ## Diagnose installation
 
 ```sh

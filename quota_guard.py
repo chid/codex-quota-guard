@@ -63,11 +63,16 @@ def write_json(path, value):
             temporary.unlink(missing_ok=True)
 
 
-def check_snapshot(snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE, now=None):
+def check_snapshot(snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE, now=None,
+                   session_stop_at=None, weekly_stop_at=None):
     """Read the widget file once. No subprocesses or network requests."""
     now = now or datetime.now(timezone.utc)
     report = {"provider": "codex", "source": "widget-snapshot", "checked_at": stamp(now),
-              "status": "unavailable", "decision": "unknown", "stop_at_percent": stop_at, "windows": []}
+              "status": "unavailable", "decision": "unknown", "stop_at_percent": stop_at,
+              "cutoffs_percent": {
+                  "primary": stop_at if session_stop_at is None else session_stop_at,
+                  "secondary": stop_at if weekly_stop_at is None else weekly_stop_at,
+              }, "windows": []}
 
     def unknown(reason):
         report["reason"] = reason
@@ -116,7 +121,7 @@ def check_snapshot(snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE, now=None):
                     return unknown("widget_quota_values_inconsistent")
         windows[name] = window
     for name, raw in windows.items():
-        window = {"name": name, "status": "unavailable"}
+        window = {"name": name, "status": "unavailable", "stop_at_percent": report["cutoffs_percent"][name]}
         report["windows"].append(window)
         if not isinstance(raw, dict):
             window["reason"] = "window_missing"
@@ -138,7 +143,7 @@ def check_snapshot(snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE, now=None):
     report.update(status="ok" if len(valid) == 2 else "partial",
                   limiting_reported_window=limiting["name"],
                   minimum_remaining_percent=limiting["remaining_percent"])
-    if limiting["remaining_percent"] <= stop_at:
+    if any(w["remaining_percent"] <= w["stop_at_percent"] for w in valid):
         report["decision"] = "stop"
     elif len(valid) == 2:
         report["decision"] = "above_threshold"
@@ -168,9 +173,11 @@ def denial(reason):
 
 
 class Guard:
-    def __init__(self, root=None, snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE):
+    def __init__(self, root=None, snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE,
+                 session_stop_at=None, weekly_stop_at=None):
         self.root = root or Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "codex-quota-guard"
         self.snapshot, self.stop_at, self.max_age = snapshot, stop_at, max_age
+        self.session_stop_at, self.weekly_stop_at = session_stop_at, weekly_stop_at
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
 
@@ -182,7 +189,8 @@ class Guard:
         return self.root / "turns" / (key + ".json")
 
     def fetch(self):
-        return check_snapshot(self.snapshot, self.stop_at, self.max_age)
+        return check_snapshot(self.snapshot, self.stop_at, self.max_age,
+                              session_stop_at=self.session_stop_at, weekly_stop_at=self.weekly_stop_at)
 
     def audit(self, event, decision, report=None):
         key = hashlib.sha256(event["session_id"].encode()).hexdigest()
@@ -197,12 +205,13 @@ class Guard:
     def block_reason(self, report):
         if report.get("decision") == "stop":
             windows = [w for w in report["windows"]
-                       if w.get("status") == "ok" and w["remaining_percent"] <= self.stop_at]
+                       if w.get("status") == "ok" and w["remaining_percent"] <= w["stop_at_percent"]]
             detail = "; ".join(
-                f"{'session' if w['name'] == 'primary' else 'weekly'} {w['remaining_percent']:g}% remaining, resets {w['resets_at']}"
+                f"{'session' if w['name'] == 'primary' else 'weekly'} {w['remaining_percent']:g}% remaining, "
+                f"cutoff {w['stop_at_percent']:g}%, resets {w['resets_at']}"
                 for w in windows
             )
-            reason = f"Codex quota cutoff reached: {detail}. The cutoff is {self.stop_at:g}%."
+            reason = f"Codex quota cutoff reached: {detail}."
         else:
             reason = "Codex widget quota could not be verified: " + str(report.get("reason", "unknown")) + ". Refresh CodexBar if its snapshot is unavailable or stale."
         return reason + f" Stop tool use and end the turn with a brief progress summary. Do not retry or bypass the guard. The user can override for one turn by adding a standalone line: {OVERRIDE}."
@@ -262,7 +271,11 @@ def brief(report):
         elapsed = f"{age}s" if age < 60 else f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
         parts.append("Updated " + elapsed + " ago")
     if report["decision"] == "stop":
-        parts.append(f"STOP ({report['stop_at_percent']:g}% cutoff)")
+        cutoffs = report["cutoffs_percent"]
+        if cutoffs["primary"] == cutoffs["secondary"]:
+            parts.append(f"STOP ({cutoffs['primary']:g}% cutoff)")
+        else:
+            parts.append(f"STOP (Session {cutoffs['primary']:g}% / Weekly {cutoffs['secondary']:g}% cutoffs)")
     elif report["decision"] == "unknown":
         parts.append("UNAVAILABLE (" + report.get("reason", "unknown") + ")")
     return " | ".join(parts)
@@ -271,6 +284,7 @@ def brief(report):
 def command_for(script, args):
     command = [sys.executable, str(script)]
     for flag, value in (("--snapshot", args.snapshot), ("--stop-at", args.stop_at),
+                        ("--session-stop-at", args.session_stop_at), ("--weekly-stop-at", args.weekly_stop_at),
                         ("--max-age", args.max_age), ("--state-dir", args.state_dir)):
         if value is not None:
             if isinstance(value, Path):
@@ -412,9 +426,11 @@ def load_hook_inventory(codex_home, cwd):
         process.stdout.close()
 
 
-def doctor(codex_home, snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE):
+def doctor(codex_home, snapshot=None, stop_at=STOP_AT, max_age=MAX_AGE,
+           session_stop_at=None, weekly_stop_at=None):
     checks = []
-    report = check_snapshot(snapshot, stop_at, max_age)
+    report = check_snapshot(snapshot, stop_at, max_age,
+                            session_stop_at=session_stop_at, weekly_stop_at=weekly_stop_at)
     checks.append((report["decision"] != "unknown", "Widget snapshot", brief(report)))
     target = codex_home / "hooks/quota_guard.py"
     try:
@@ -462,15 +478,19 @@ def main(argv=None):
     mode.add_argument("--install", action="store_true", help="Install this script and merge hook definitions, preserving other hooks.")
     mode.add_argument("--doctor", action="store_true", help="Check the cache, installed script, and actual Codex hook trust and enablement.")
     parser.add_argument("--snapshot", type=Path, help="Use a specific widget-snapshot.json instead of discovering it.")
-    parser.add_argument("--stop-at", type=float, default=STOP_AT, help="Inclusive remaining-percent cutoff, default 3.")
+    parser.add_argument("--stop-at", type=float, default=STOP_AT, help="Remaining-percent cutoff for both windows unless overridden, default 3.")
+    parser.add_argument("--session-stop-at", type=float, help="Override the remaining-percent cutoff for the session (five-hour) window.")
+    parser.add_argument("--weekly-stop-at", type=float, help="Override the remaining-percent cutoff for the weekly window.")
     parser.add_argument("--max-age", type=float, default=MAX_AGE, help="Maximum provider reading age in seconds, default 600.")
     parser.add_argument("--state-dir", type=Path, help="Override the directory for private per-turn state.")
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
                         help="Codex home for --install and --doctor; defaults to CODEX_HOME or ~/.codex.")
     args = parser.parse_args(argv)
     args.codex_home = args.codex_home.expanduser().resolve()
-    if not number(args.stop_at) or not 0 <= args.stop_at <= 100:
-        parser.error("--stop-at must be between 0 and 100")
+    for flag, value in (("--stop-at", args.stop_at), ("--session-stop-at", args.session_stop_at),
+                        ("--weekly-stop-at", args.weekly_stop_at)):
+        if value is not None and (not number(value) or not 0 <= value <= 100):
+            parser.error(flag + " must be between 0 and 100")
     if not number(args.max_age) or args.max_age <= 0:
         parser.error("--max-age must be positive and finite")
     if args.print_hooks:
@@ -492,12 +512,14 @@ def main(argv=None):
             print("Run --doctor to verify hook trust and enablement.")
         return 0
     if args.doctor:
-        checks = doctor(args.codex_home, args.snapshot, args.stop_at, args.max_age)
+        checks = doctor(args.codex_home, args.snapshot, args.stop_at, args.max_age,
+                        args.session_stop_at, args.weekly_stop_at)
         for ok, name, detail in checks:
             print(("OK " if ok else "FAIL ") + name + ": " + detail)
         return 0 if all(ok for ok, _, _ in checks) else 2
     if args.check or args.brief:
-        report = check_snapshot(args.snapshot, args.stop_at, args.max_age)
+        report = check_snapshot(args.snapshot, args.stop_at, args.max_age,
+                                session_stop_at=args.session_stop_at, weekly_stop_at=args.weekly_stop_at)
         print(brief(report) if args.brief else json.dumps(report, indent=2, allow_nan=False))
         return {"above_threshold": 0, "stop": 3, "unknown": 2}[report["decision"]]
     event = {}
@@ -506,7 +528,8 @@ def main(argv=None):
         if not isinstance(event, dict):
             event = {}
             raise ValueError("invalid_hook_input")
-        output = Guard(args.state_dir, args.snapshot, args.stop_at, args.max_age).handle(event)
+        output = Guard(args.state_dir, args.snapshot, args.stop_at, args.max_age,
+                       args.session_stop_at, args.weekly_stop_at).handle(event)
     except Exception as error:
         reason = f"Codex quota guard could not verify permission ({type(error).__name__}). Stop tool use and report the failure."
         output = {"continue": False, "stopReason": reason} if event.get("hook_event_name") == "Stop" else denial(reason)

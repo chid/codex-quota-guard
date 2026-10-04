@@ -188,6 +188,55 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertEqual(self.cli("--check", "--stop-at", "5").returncode, 3)
         self.assertEqual(self.cli("--check", "--max-age", "300").returncode, 2)
 
+    def test_cli_independent_cutoffs_use_each_window_inclusively(self):
+        for session, weekly, expected in ((5, 90, 3), (90, 10, 3), (5.1, 10.1, 0)):
+            with self.subTest(session=session, weekly=weekly):
+                write_json(self.snapshot, self.snapshot_data(session=session, weekly=weekly))
+                result = self.cli("--check", "--session-stop-at", "5", "--weekly-stop-at", "10")
+                self.assertEqual(result.returncode, expected, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["cutoffs_percent"], {"primary": 5, "secondary": 10})
+                self.assertEqual([w["stop_at_percent"] for w in report["windows"]], [5, 10])
+
+    def test_weekly_cutoff_triggers_even_when_session_has_less_remaining(self):
+        write_json(self.snapshot, self.snapshot_data(session=4, weekly=6))
+        result = self.cli("--check", "--weekly-stop-at", "10")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["cutoffs_percent"], {"primary": 3, "secondary": 10})
+
+    def test_specific_cutoffs_override_shared_cutoff_in_either_option_order(self):
+        write_json(self.snapshot, self.snapshot_data(session=2, weekly=3))
+        for options in (("--stop-at", "5", "--session-stop-at", "1", "--weekly-stop-at", "2"),
+                        ("--weekly-stop-at", "2", "--session-stop-at", "1", "--stop-at", "5")):
+            result = self.cli("--check", *options)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["cutoffs_percent"], {"primary": 1, "secondary": 2})
+
+    def test_unset_window_inherits_shared_cutoff(self):
+        write_json(self.snapshot, self.snapshot_data(session=6, weekly=11))
+        result = self.cli("--check", "--stop-at", "5", "--weekly-stop-at", "10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["cutoffs_percent"], {"primary": 5, "secondary": 10})
+
+    def test_independent_cutoffs_keep_missing_or_stale_readings_blocked(self):
+        for age, remove_weekly, expected in ((601, False, "unknown"), (0, True, "unknown")):
+            data = self.snapshot_data(session=50, age=age)
+            if remove_weekly:
+                data["entries"][0]["usageRows"].pop()
+            write_json(self.snapshot, data)
+            report = check_snapshot(self.snapshot, session_stop_at=5, weekly_stop_at=10)
+            self.assertEqual(report["decision"], expected)
+
+    def test_cli_hook_denial_reports_the_window_specific_cutoff(self):
+        write_json(self.snapshot, self.snapshot_data(session=50, weekly=8))
+        result = self.cli("--state-dir", str(self.guard.root), "--session-stop-at", "5",
+                          "--weekly-stop-at", "10", input=json.dumps(self.event))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("weekly 8% remaining, cutoff 10%, resets", output["permissionDecisionReason"])
+        self.assertNotIn("session 50% remaining", output["permissionDecisionReason"])
+
     def test_cli_hook_consumes_stdin_and_denies(self):
         write_json(self.snapshot, self.snapshot_data(session=3))
         result = self.cli("--state-dir", str(self.guard.root), input=json.dumps(self.event))
@@ -211,8 +260,10 @@ class QuotaGuardTests(unittest.TestCase):
             self.assertIn("5.0", command)
 
     def test_cli_rejects_invalid_limits(self):
-        for args in (("--stop-at", "nan"), ("--stop-at", "101"), ("--max-age", "0")):
-            self.assertEqual(self.cli("--check", *args).returncode, 2)
+        for flag in ("--stop-at", "--session-stop-at", "--weekly-stop-at"):
+            for value in ("nan", "inf", "-1", "101"):
+                self.assertEqual(self.cli("--check", flag, value).returncode, 2)
+        self.assertEqual(self.cli("--check", "--max-age", "0").returncode, 2)
 
     def test_brief_literal_output_and_age(self):
         data = self.snapshot_data(session=88, weekly=94, age=310)
@@ -236,6 +287,12 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout.strip(),
                          "Session ? | Weekly ? | UNAVAILABLE (widget_snapshot_missing_or_invalid)")
+
+    def test_cli_brief_reports_effective_independent_cutoffs(self):
+        write_json(self.snapshot, self.snapshot_data(session=50, weekly=8))
+        result = self.cli("--brief", "--session-stop-at", "5", "--weekly-stop-at", "10")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("STOP (Session 5% / Weekly 10% cutoffs)", result.stdout)
 
     def test_brief_unknown_remains_unavailable_with_partial_quota(self):
         data = self.snapshot_data()
@@ -320,6 +377,16 @@ class QuotaGuardTests(unittest.TestCase):
             result = main(["--doctor", "--snapshot", str(self.snapshot), "--codex-home", str(home)])
         self.assertEqual(result, 0)
         self.assertIn("STOP (3% cutoff)", output.getvalue())
+
+    def test_doctor_uses_requested_independent_cutoffs(self):
+        home, inventory = self.doctor_fixture()
+        write_json(self.snapshot, self.snapshot_data(session=50, weekly=8))
+        output = io.StringIO()
+        with patch("quota_guard.load_hook_inventory", return_value=inventory), redirect_stdout(output):
+            result = main(["--doctor", "--snapshot", str(self.snapshot), "--codex-home", str(home),
+                           "--session-stop-at", "5", "--weekly-stop-at", "10"])
+        self.assertEqual(result, 0)
+        self.assertIn("STOP (Session 5% / Weekly 10% cutoffs)", output.getvalue())
 
     def test_native_inventory_protocol_queries_hooks_without_starting_a_task(self):
         executable = Path(self.directory.name) / "codex"
@@ -487,6 +554,17 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(str((self.home / "cache with spaces.json").resolve()), arguments)
         self.assertIn(str((self.home / "state with spaces").resolve()), arguments)
         self.assertIn("5.0", arguments)
+
+    def test_cli_install_preserves_independent_cutoffs_in_all_hook_commands(self):
+        result = subprocess.run([sys.executable, str(self.source.resolve()), "--install",
+                                 "--codex-home", str(self.home), "--session-stop-at", "5",
+                                 "--weekly-stop-at", "10"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hooks = json.loads(self.config.read_text())["hooks"]
+        for groups in hooks.values():
+            command = shlex.split(groups[0]["hooks"][0]["command"])
+            self.assertEqual(command[command.index("--session-stop-at")+1], "5.0")
+            self.assertEqual(command[command.index("--weekly-stop-at")+1], "10.0")
 
 
 if __name__ == "__main__":
